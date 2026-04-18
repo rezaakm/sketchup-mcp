@@ -640,8 +640,178 @@ def eval_ruby(
             "error": str(e)
         })
 
+# ──────────────────────────────────────────────────────────────────────────
+# Phase B + C: new tools (batch, undo_last, measure, snapshot,
+# list_definitions, list_instances, select, units_info, transaction)
+# ──────────────────────────────────────────────────────────────────────────
+
+def _text_of(result: Dict[str, Any]) -> str:
+    """Extract the text payload from a SketchUp tool-call response."""
+    content = result.get("content")
+    if isinstance(content, list) and content:
+        item = content[0]
+        if isinstance(item, dict):
+            return item.get("text", "")
+    return ""
+
+
+def _call(ctx: Context, tool: str, args: Optional[Dict[str, Any]] = None,
+          timeout: Optional[float] = None) -> str:
+    """Low-level call helper: returns JSON string of the tool response."""
+    try:
+        conn = get_sketchup_connection()
+        result = conn.send_command(
+            method="tools/call",
+            params={"name": tool, "arguments": args or {}},
+            request_id=ctx.request_id,
+            timeout=timeout,
+        )
+        # Prefer the structured payload if present, else the text.
+        structured = result.get("structured")
+        if structured is not None:
+            return json.dumps({"success": True, "result": structured})
+        text = _text_of(result)
+        return json.dumps({"success": True, "result": text})
+    except SketchupServerNotRunningError as e:
+        logger.error(str(e))
+        return json.dumps({"success": False, "error": str(e), "kind": "server_not_running"})
+    except SketchupRubyError as e:
+        logger.error("Ruby error: %s", e)
+        return json.dumps({"success": False, "error": str(e), "kind": "ruby_error",
+                           "backtrace": e.backtrace, "code": e.code})
+    except (SketchupTimeoutError, SketchupTransportError) as e:
+        logger.error("Transport: %s", e)
+        return json.dumps({"success": False, "error": str(e), "kind": "transport"})
+    except Exception as e:
+        logger.exception("Unexpected error in %s", tool)
+        return json.dumps({"success": False, "error": str(e), "kind": "unexpected"})
+
+
+@mcp.tool()
+def batch(ctx: Context, calls: List[Dict[str, Any]],
+          wrap_undo: bool = True, undo_name: str = "MCP batch",
+          stop_on_error: bool = True) -> str:
+    """Run multiple tool calls as one undo-wrapped transaction.
+
+    Args:
+        calls: List of {"tool": "<name>", "args": {...}} objects.
+        wrap_undo: Wrap the whole batch in start_operation/commit_operation.
+        undo_name: Label for the undo history entry.
+        stop_on_error: If True, abort the whole batch on first failure.
+    """
+    return _call(ctx, "batch",
+                 {"calls": calls, "wrap_undo": wrap_undo,
+                  "undo_name": undo_name, "stop_on_error": stop_on_error},
+                 timeout=LONG_TIMEOUT)
+
+
+@mcp.tool()
+def undo_last(ctx: Context, steps: int = 1) -> str:
+    """Undo the last N operations on the active model."""
+    return _call(ctx, "undo_last", {"steps": steps})
+
+
+@mcp.tool()
+def measure(ctx: Context, id: int) -> str:
+    """Return bounds (cm), position, material, and class for an entity by id."""
+    return _call(ctx, "measure", {"id": id})
+
+
+@mcp.tool()
+def snapshot(ctx: Context, width: int = 1600, height: int = 1000,
+             camera: Optional[Dict[str, Any]] = None,
+             antialias: bool = True, path: Optional[str] = None,
+             compression: float = 0.9) -> str:
+    """Render the active view to a PNG.
+
+    Args:
+        width, height: Output pixel dimensions.
+        camera: Optional {eye: [x,y,z], target: [x,y,z], up: [x,y,z],
+                          perspective: bool, fov: float}.
+        antialias: Enable 2x AA.
+        path: Destination path (default: temp file).
+        compression: PNG compression 0..1.
+    """
+    args: Dict[str, Any] = {
+        "width": width, "height": height,
+        "antialias": antialias, "compression": compression,
+    }
+    if camera is not None:
+        args["camera"] = camera
+    if path is not None:
+        args["path"] = path
+    return _call(ctx, "snapshot", args, timeout=LONG_TIMEOUT)
+
+
+@mcp.tool()
+def list_definitions(ctx: Context, name_match: Optional[str] = None,
+                     include_bounds: bool = True) -> str:
+    """List all component definitions in the active model.
+
+    Args:
+        name_match: Case-insensitive regex to filter by name.
+        include_bounds: Include per-definition bounds in cm.
+    """
+    args: Dict[str, Any] = {"include_bounds": include_bounds}
+    if name_match is not None:
+        args["name_match"] = name_match
+    return _call(ctx, "list_definitions", args)
+
+
+@mcp.tool()
+def list_instances(ctx: Context, definition_name: Optional[str] = None,
+                   limit: int = 500,
+                   bounds: Optional[Dict[str, List[float]]] = None) -> str:
+    """List instances (components + groups) in the active model.
+
+    Args:
+        definition_name: Exact definition/group name filter.
+        limit: Max entries to return.
+        bounds: Optional {"min":[x,y,z], "max":[x,y,z]} bbox filter (inches).
+    """
+    args: Dict[str, Any] = {"limit": limit}
+    if definition_name is not None:
+        args["definition_name"] = definition_name
+    if bounds is not None:
+        args["bounds"] = bounds
+    return _call(ctx, "list_instances", args)
+
+
+@mcp.tool()
+def select(ctx: Context, ids: List[int]) -> str:
+    """Replace the current SketchUp selection with the given entity IDs."""
+    return _call(ctx, "select", {"ids": ids})
+
+
+@mcp.tool()
+def units_info(ctx: Context) -> str:
+    """Return model length unit and conversion factors."""
+    return _call(ctx, "units_info")
+
+
+@mcp.tool()
+def transaction(ctx: Context, action: str, name: str = "MCP transaction",
+                disable_ui: bool = True) -> str:
+    """Explicit undo-transaction control.
+
+    Args:
+        action: 'start', 'commit', or 'abort'.
+        name: Undo label (start only).
+        disable_ui: Disable UI refresh during operation (start only).
+    """
+    return _call(ctx, "transaction",
+                 {"action": action, "name": name, "disable_ui": disable_ui})
+
+
+@mcp.tool()
+def ping(ctx: Context) -> str:
+    """Cheap health check: returns server version and timestamp."""
+    return _call(ctx, "ping")
+
+
 def main():
     mcp.run()
+
 
 if __name__ == "__main__":
     main()

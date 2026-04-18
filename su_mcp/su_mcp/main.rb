@@ -4,6 +4,7 @@ require 'socket'
 require 'fileutils'
 require 'timeout'
 require 'logger'
+require 'tmpdir'
 
 puts "MCP Extension loading..."
 
@@ -408,6 +409,26 @@ module SU_MCP
           create_finger_joint(args)
         when "eval_ruby"
           eval_ruby(args)
+        when "batch"
+          batch(args)
+        when "undo_last"
+          undo_last(args)
+        when "measure"
+          measure(args)
+        when "snapshot"
+          snapshot(args)
+        when "list_definitions"
+          list_definitions(args)
+        when "list_instances"
+          list_instances(args)
+        when "select"
+          select_entities(args)
+        when "units_info"
+          units_info(args)
+        when "transaction"
+          transaction(args)
+        when "ping"
+          { success: true, result: { pong: true, version: VERSION, time: Time.now.to_f } }
         else
           raise "Unknown tool: #{tool_name}"
         end
@@ -1996,6 +2017,303 @@ module SU_MCP
       }
     end
     
+    # ──────────────────────────────────────────────────────────────────
+    # Phase B: batch & undo_last
+    # ──────────────────────────────────────────────────────────────────
+
+    # batch({ "calls": [{"tool": "eval_ruby", "args": {...}}, ...],
+    #         "wrap_undo": true, "undo_name": "MCP batch", "stop_on_error": true })
+    # Runs each sub-call inside ONE model.start_operation / commit_operation,
+    # returning an array of per-call results. Any call that raises either
+    # aborts the whole batch (stop_on_error) or is recorded as an error
+    # entry and the batch continues.
+    def batch(params)
+      calls = Array(params["calls"])
+      wrap_undo     = params["wrap_undo"] != false  # default true
+      undo_name     = params["undo_name"] || "MCP batch"
+      stop_on_error = params["stop_on_error"] != false
+
+      results = []
+      model = Sketchup.active_model
+
+      runner = lambda do
+        calls.each_with_index do |call, i|
+          begin
+            tool_name = call["tool"] || call[:tool]
+            args      = call["args"] || call[:args] || {}
+            sub_req = {
+              "jsonrpc" => "2.0",
+              "method"  => "tools/call",
+              "params"  => { "name" => tool_name, "arguments" => args },
+              "id"      => "batch-#{i}"
+            }
+            resp = handle_tool_call(sub_req)
+            if resp[:error] || resp["error"]
+              err = resp[:error] || resp["error"]
+              msg = err[:message] || err["message"]
+              results << { index: i, success: false, error: msg }
+              raise "batch[#{i}] failed: #{msg}" if stop_on_error
+            else
+              payload = resp[:result] || resp["result"]
+              results << { index: i, success: true, result: payload }
+            end
+          rescue StandardError => e
+            results << { index: i, success: false, error: e.message }
+            raise if stop_on_error
+          end
+        end
+      end
+
+      if wrap_undo && model
+        model.start_operation(undo_name, true)
+        begin
+          runner.call
+          model.commit_operation
+        rescue StandardError => e
+          model.abort_operation rescue nil
+          return { success: false, error: e.message, result: { completed: results.size, results: results } }
+        end
+      else
+        runner.call
+      end
+
+      { success: true, result: { count: results.size, results: results } }
+    end
+
+    # undo_last({ "steps": 1 }) — undo N operations in active model
+    def undo_last(params)
+      steps = (params && params["steps"] || 1).to_i
+      steps = 1 if steps < 1
+      model = Sketchup.active_model
+      raise "No active model" unless model
+      undone = 0
+      steps.times do
+        begin
+          model.undo_operation
+          undone += 1
+        rescue StandardError
+          break
+        end
+      end
+      { success: true, result: { undone: undone, requested: steps } }
+    end
+
+    # ──────────────────────────────────────────────────────────────────
+    # Phase C: new capability tools
+    # ──────────────────────────────────────────────────────────────────
+
+    # measure({ "id": 12345 }) — bounds + position + material + class
+    def measure(params)
+      entity_id = (params["id"] || params["entity_id"]).to_i
+      model = Sketchup.active_model
+      raise "No active model" unless model
+      entity = model.find_entity_by_id(entity_id)
+      raise "No entity with id=#{entity_id}" unless entity
+
+      data = {
+        id: entity_id,
+        class: entity.class.name,
+        valid: entity.valid?
+      }
+      if entity.respond_to?(:bounds)
+        bb = entity.bounds
+        data[:bounds_cm] = {
+          min: bb.min.to_a.map { |v| (v.to_f / 0.393700787).round(3) },
+          max: bb.max.to_a.map { |v| (v.to_f / 0.393700787).round(3) },
+          size: [bb.width, bb.height, bb.depth].map { |v| (v.to_f / 0.393700787).round(3) }
+        }
+      end
+      if entity.respond_to?(:transformation)
+        o = entity.transformation.origin
+        data[:position_cm] = o.to_a.map { |v| (v.to_f / 0.393700787).round(3) }
+      end
+      if entity.respond_to?(:material) && entity.material
+        data[:material] = { name: entity.material.display_name, color: entity.material.color.to_a }
+      end
+      if entity.is_a?(Sketchup::ComponentInstance)
+        data[:definition] = entity.definition.name
+      elsif entity.is_a?(Sketchup::Group)
+        data[:group_name] = entity.name
+      end
+      { success: true, result: data }
+    end
+
+    # snapshot({ "width": 1600, "height": 1000, "camera": {...optional...}, "antialias": true })
+    # Renders the current view to a temp PNG and returns the absolute path
+    # plus width/height. Base64 encoding skipped by default (large payload).
+    def snapshot(params)
+      params ||= {}
+      width  = (params["width"]  || 1600).to_i
+      height = (params["height"] || 1000).to_i
+      antialias = params["antialias"] != false
+      compression = (params["compression"] || 0.9).to_f
+      path = params["path"] || File.join(Dir.tmpdir, "sketchup_mcp_snapshot_#{Time.now.to_i}.png")
+
+      model = Sketchup.active_model
+      view = model.active_view
+
+      if params["camera"]
+        cam_p = params["camera"]
+        eye    = Geom::Point3d.new(*cam_p["eye"])    if cam_p["eye"]
+        target = Geom::Point3d.new(*cam_p["target"]) if cam_p["target"]
+        up_v   = Geom::Vector3d.new(*cam_p["up"])    if cam_p["up"]
+        persp  = cam_p.fetch("perspective", true)
+        fov    = cam_p["fov"] || 50.0
+        if eye && target && up_v
+          view.camera = Sketchup::Camera.new(eye, target, up_v, persp, fov)
+        end
+      end
+
+      view.write_image(path, width, height, antialias, compression)
+      { success: true, result: { path: path, width: width, height: height } }
+    end
+
+    # list_definitions({ "name_match": "Sofa", "include_bounds": true })
+    def list_definitions(params)
+      params ||= {}
+      model = Sketchup.active_model
+      raise "No active model" unless model
+      match = params["name_match"]
+      include_bounds = params["include_bounds"] != false
+
+      results = model.definitions.map do |d|
+        entry = {
+          name: d.name,
+          guid: (d.guid rescue nil),
+          instance_count: d.count_instances,
+          is_component: d.is_a?(Sketchup::ComponentDefinition)
+        }
+        if include_bounds
+          bb = d.bounds
+          entry[:bounds_cm] = {
+            size: [bb.width, bb.height, bb.depth].map { |v| (v.to_f / 0.393700787).round(3) }
+          }
+        end
+        entry
+      end
+
+      if match && !match.empty?
+        rx = Regexp.new(match, Regexp::IGNORECASE)
+        results = results.select { |e| rx.match?(e[:name].to_s) }
+      end
+
+      { success: true, result: { count: results.size, definitions: results } }
+    end
+
+    # list_instances({ "definition_name": "Single Sofa", "limit": 200,
+    #                  "bounds": { "min": [x,y,z], "max": [x,y,z] } })
+    def list_instances(params)
+      params ||= {}
+      model = Sketchup.active_model
+      raise "No active model" unless model
+      want_def = params["definition_name"]
+      limit = (params["limit"] || 500).to_i
+      bb_filter = params["bounds"]
+
+      collected = []
+      walker = lambda do |ents|
+        ents.each do |e|
+          break if collected.size >= limit
+          case e
+          when Sketchup::ComponentInstance
+            if !want_def || e.definition.name == want_def
+              bb = e.bounds
+              if pass_bb_filter?(bb, bb_filter)
+                collected << {
+                  id: e.entityID,
+                  definition: e.definition.name,
+                  position_cm: e.transformation.origin.to_a.map { |v| (v.to_f / 0.393700787).round(3) },
+                  bounds_min_cm: bb.min.to_a.map { |v| (v.to_f / 0.393700787).round(3) },
+                  bounds_max_cm: bb.max.to_a.map { |v| (v.to_f / 0.393700787).round(3) }
+                }
+              end
+            end
+          when Sketchup::Group
+            if !want_def || e.name == want_def
+              bb = e.bounds
+              if pass_bb_filter?(bb, bb_filter)
+                collected << {
+                  id: e.entityID,
+                  group_name: e.name,
+                  bounds_min_cm: bb.min.to_a.map { |v| (v.to_f / 0.393700787).round(3) },
+                  bounds_max_cm: bb.max.to_a.map { |v| (v.to_f / 0.393700787).round(3) }
+                }
+              end
+            end
+          end
+        end
+      end
+      walker.call(model.entities)
+
+      { success: true, result: { count: collected.size, instances: collected, truncated: collected.size >= limit } }
+    end
+
+    def pass_bb_filter?(bb, filter)
+      return true unless filter
+      min = filter["min"]; max = filter["max"]
+      return true unless min && max
+      !(bb.max.x < min[0] || bb.min.x > max[0] ||
+        bb.max.y < min[1] || bb.min.y > max[1] ||
+        bb.max.z < min[2] || bb.min.z > max[2])
+    end
+
+    # select({ "ids": [1234, 5678] }) — replaces current selection
+    def select_entities(params)
+      params ||= {}
+      model = Sketchup.active_model
+      raise "No active model" unless model
+      ids = Array(params["ids"]).map(&:to_i)
+      model.selection.clear
+      resolved = ids.map { |i| model.find_entity_by_id(i) }.compact
+      model.selection.add(resolved)
+      { success: true, result: { requested: ids.size, selected: resolved.size, missing: ids.size - resolved.size } }
+    end
+
+    # units_info — expose length unit + conversion factors so the client
+    # never has to guess inches vs cm.
+    def units_info(params)
+      model = Sketchup.active_model
+      raise "No active model" unless model
+      opts = model.options["UnitsOptions"]
+      names = { 0 => "inches", 1 => "feet", 2 => "mm", 3 => "cm", 4 => "m" }
+      {
+        success: true,
+        result: {
+          length_unit_code: opts["LengthUnit"],
+          length_unit_name: names[opts["LengthUnit"]] || "unknown",
+          inches_per_cm: 1.cm.to_f,
+          cm_per_inch: (1.0 / 1.cm.to_f),
+          model_title: model.title,
+          model_path: model.path
+        }
+      }
+    end
+
+    # transaction({ "action": "start"|"commit"|"abort", "name": "...", "disable_ui": true })
+    # Gives the client explicit control over undo boundaries when not using
+    # the auto-wrap in eval_ruby / batch.
+    def transaction(params)
+      params ||= {}
+      model = Sketchup.active_model
+      raise "No active model" unless model
+      action = (params["action"] || "start").downcase
+      case action
+      when "start", "begin"
+        model.start_operation(params["name"] || "MCP transaction", params["disable_ui"] != false)
+        { success: true, result: { action: "started" } }
+      when "commit", "end"
+        model.commit_operation
+        { success: true, result: { action: "committed" } }
+      when "abort", "rollback", "cancel"
+        model.abort_operation
+        { success: true, result: { action: "aborted" } }
+      else
+        raise "Unknown transaction action: #{action}"
+      end
+    end
+
+    # ──────────────────────────────────────────────────────────────────
+
     def eval_ruby(params)
       code = params["code"].to_s
       timeout_s = (params["timeout"] || @eval_timeout).to_i

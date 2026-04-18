@@ -181,22 +181,21 @@ def t_eval_multiline_string(c: Client) -> None:
 
 
 def t_eval_error_has_backtrace(c: Client) -> None:
-    try:
-        c.send("eval_ruby", {"code": "undefined_method_call"})
-    except Exception as e:
-        assert "undefined" in str(e).lower() or "NameError" in str(e)
-        return
-    raise AssertionError("expected Ruby error")
+    r = c.send("eval_ruby", {"code": "undefined_method_call"})
+    assert "error" in r, f"expected error in response, got: {r}"
+    assert r["error"]["code"] == -32002, f"expected -32002, got {r['error'].get('code')}"
+    msg = r["error"]["message"].lower()
+    assert "undefined" in msg or "namerror" in msg, f"unexpected message: {msg}"
+    bt = (r["error"].get("data") or {}).get("backtrace")
+    assert isinstance(bt, list) and len(bt) >= 1, "expected backtrace in data"
 
 
 def t_eval_timeout(c: Client) -> None:
-    try:
-        c.send("eval_ruby",
+    r = c.send("eval_ruby",
                {"code": "sleep 10", "timeout": 2}, timeout=15.0)
-    except Exception as e:
-        assert "timed out" in str(e).lower() or "timeout" in str(e).lower()
-        return
-    raise AssertionError("expected timeout")
+    assert "error" in r, f"expected error (timeout), got: {r}"
+    msg = r["error"]["message"].lower()
+    assert "timed out" in msg or "timeout" in msg, f"unexpected message: {msg}"
 
 
 def t_list_definitions(c: Client) -> None:

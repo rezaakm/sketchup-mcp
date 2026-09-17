@@ -4,6 +4,7 @@ import json
 import os
 import threading
 import logging
+import time
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, List, Optional, Tuple
@@ -89,10 +90,10 @@ class SketchupConnection:
             self.buffer = b""
             logger.info("Connected to SketchUp at %s:%s", self.host, self.port)
         except ConnectionRefusedError as e:
-            self.sock = None
+            self.disconnect()
             raise SketchupServerNotRunningError(self.host, self.port) from e
         except OSError as e:
-            self.sock = None
+            self.disconnect()
             raise SketchupTransportError(f"Could not connect: {e}") from e
 
     def disconnect(self) -> None:
@@ -116,9 +117,7 @@ class SketchupConnection:
         Returns the parsed dict and consumes its bytes from the buffer.
         """
         assert self.sock is not None
-        self.sock.settimeout(timeout)
-        end_time: Optional[float] = None
-        import time
+        deadline = time.monotonic() + timeout
 
         while True:
             # First, try to parse what's already in the buffer.
@@ -127,7 +126,11 @@ class SketchupConnection:
                 self.buffer = self.buffer[consumed:]
                 return parsed
 
-            # Read more data.
+            # Bound total elapsed time, not just each individual recv.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SketchupTimeoutError(f"Read timed out after {timeout}s")
+            self.sock.settimeout(remaining)
             try:
                 chunk = self.sock.recv(READ_CHUNK)
             except socket.timeout as e:
@@ -229,25 +232,36 @@ class SketchupConnection:
 
         # Serialize under lock so concurrent callers don't interleave bytes
         with self._lock:
-            last_error: Optional[Exception] = None
+            # Retry only connection establishment: once bytes are sent, the plugin
+            # may have changed the scene even if its response never arrives.
             for attempt in range(MAX_RETRIES + 1):
                 try:
                     self._ensure_connected()
-                    wire = (json.dumps(request) + "\n").encode("utf-8")
-                    logger.debug("→ %s (%d bytes, attempt %d)", method, len(wire), attempt + 1)
-                    assert self.sock is not None
-                    self.sock.sendall(wire)
-                    response = self._read_until_json(timeout)
-                    logger.debug("← %s (id=%s)", method, response.get("id"))
+                    break
+                except SketchupServerNotRunningError:
+                    raise
+                except SketchupTransportError:
+                    self.disconnect()
+                    if attempt >= MAX_RETRIES:
+                        raise
+                    time.sleep(0.1 * (attempt + 1))
 
-                    # Reject wrong-id responses (stale retry collision)
-                    if response.get("id") not in (None, request["id"]):
-                        logger.warning(
-                            "Discarding response with mismatched id: got %s, want %s",
-                            response.get("id"), request["id"],
-                        )
-                        continue  # try to read next message
-
+            try:
+                wire = (json.dumps(request) + "\n").encode("utf-8")
+                assert self.sock is not None
+                self.sock.settimeout(timeout)
+                self.sock.sendall(wire)
+                deadline = time.monotonic() + timeout
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise SketchupTimeoutError(f"Response timed out after {timeout}s")
+                    response = self._read_until_json(remaining)
+                    if not isinstance(response, dict):
+                        raise SketchupTransportError("Expected a JSON-RPC response object")
+                    if response.get("id") != request["id"]:
+                        logger.warning("Discarding mismatched response id: %s", response.get("id"))
+                        continue  # Read again; never resend the command.
                     if "error" in response:
                         err = response["error"]
                         raise SketchupRubyError(
@@ -256,23 +270,15 @@ class SketchupConnection:
                             code=err.get("code"),
                         )
                     return response.get("result", {})
-
-                except SketchupServerNotRunningError:
-                    raise  # user-actionable, don't retry
-                except SketchupRubyError:
-                    raise  # application-level, don't retry
-                except (SketchupTransportError, SketchupTimeoutError) as e:
-                    last_error = e
-                    logger.warning("Attempt %d/%d failed: %s", attempt + 1, MAX_RETRIES + 1, e)
-                    self.disconnect()
-                    if attempt >= MAX_RETRIES:
-                        break
-                    # brief backoff
-                    import time
-                    time.sleep(0.1 * (attempt + 1))
-
-            assert last_error is not None
-            raise last_error
+            except SketchupRubyError:
+                raise
+            except (SketchupTransportError, SketchupTimeoutError, OSError) as e:
+                self.disconnect()
+                message = (f"{e}. Command was not replayed: execution status is unknown; "
+                           "inspect the model before retrying.")
+                if isinstance(e, (SketchupTimeoutError, socket.timeout)):
+                    raise SketchupTimeoutError(message) from e
+                raise SketchupTransportError(message) from e
 
 
 # ───── Global connection singleton ────────────────────────────────────────

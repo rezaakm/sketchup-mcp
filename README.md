@@ -93,7 +93,7 @@ Once connected, Claude can interact with SketchUp using the following capabiliti
 | `SKETCHUP_MCP_TIMEOUT` | `60` | Per-request timeout (s) |
 | `SKETCHUP_MCP_LONG_TIMEOUT` | `300` | Timeout for `batch` / `snapshot` (s) |
 | `SKETCHUP_MCP_EVAL_TIMEOUT` | `30` | Default `eval_ruby` timeout (s) |
-| `SKETCHUP_MCP_MAX_RETRIES` | `2` | Transport-error retries |
+| `SKETCHUP_MCP_MAX_RETRIES` | `2` | Connection-establishment retries only; commands are never replayed after sending |
 | `SKETCHUP_MCP_READ_CHUNK` | `32768` | Socket read chunk size (bytes) |
 | `SKETCHUP_MCP_LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARN` / `ERROR` |
 | `SKETCHUP_MCP_LOG_FILE` | unset | Optional absolute path for Ruby-side log |
@@ -163,3 +163,25 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## License
 
 MIT 
+
+## Local bridge verification and installation
+
+Run scene-free transport tests with `uv run python -m unittest discover -s tests -v`.
+These use local socket fixtures; they do not prove geometry inside SketchUp.
+The connection never automatically resends a command after sending has begun:
+a lost response leaves execution status unknown. Inspect the model before retrying.
+Mismatched response IDs are skipped by reading again, without resending the request.
+The response timeout bounds total elapsed read time, including partial chunks.
+
+Build the repository extension with `python3 scripts/package_extension.py`.
+Install the resulting `dist/su_mcp_v2.0.0.rbz` through SketchUp Extension Manager.
+This includes the canonical `su_mcp/su_mcp.rb` loader and `su_mcp/su_mcp/main.rb`.
+Start the plugin from Extensions → MCP Server → Start Server. First connect
+against a new blank model; do not run the existing full smoke test against an
+important scene because it includes Ruby evaluation, transactions and snapshots.
+For a read-only connectivity check use `uv run python scripts/smoke_test.py -k ping`.
+
+To run this reviewed source, configure your MCP client with `uv --directory
+/absolute/path/to/this/checkout run sketchup-mcp` (separate arguments in its config).
+The earlier `uvx sketchup-mcp` example obtains the PyPI release and does not
+necessarily run this branch's fixes.

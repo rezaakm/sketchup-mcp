@@ -511,6 +511,7 @@ module SU_MCP
           )
           log "Created face: #{face.inspect}"
           
+          face.reverse! if face.normal.z < 0
           face.pushpull(dims[2])
           log "Pushed/pulled face by #{dims[2]}"
           
@@ -554,7 +555,9 @@ module SU_MCP
           # Create the circular face
           face = group.entities.add_face(circle_points)
           
-          # Extrude the face to create the cylinder
+          # SketchUp orients faces on the ground plane downward.
+          face.reverse! if face.normal.z < 0
+          # Extrude positive heights upward from the supplied base.
           face.pushpull(height)
           
           result = { 

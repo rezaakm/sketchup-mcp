@@ -185,3 +185,17 @@ To run this reviewed source, configure your MCP client with `uv --directory
 /absolute/path/to/this/checkout run sketchup-mcp` (separate arguments in its config).
 The earlier `uvx sketchup-mcp` example obtains the PyPI release and does not
 necessarily run this branch's fixes.
+
+### Native verification — 17 September 2026
+
+SketchUp 2026 loaded the installed 2.0.0 extension and answered local bridge
+requests in a newly created, unsaved template. Cube and cylinder fixtures were
+created, measured, exported as an 800×600 PNG and individually deleted; the
+original template instance IDs remained unchanged. Positive heights now extrude
+upward even when SketchUp initially orients a ground-plane face downward.
+
+Creation dimensions and positions use SketchUp's native **inches**; `measure`
+reports **centimetres**. Model display units do not change this API convention.
+The native cube input `[10,20,30]` measured `[25.4,50.8,76.2]` cm. Convert intended
+metric inputs explicitly before creation; do not interpret these fields as cm.
+The camera snapshot also uses native SketchUp coordinates.
